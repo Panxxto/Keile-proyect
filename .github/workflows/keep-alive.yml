@@ -1,0 +1,62 @@
+name: Mantener Supabase Activo
+
+on:
+  # Se ejecuta automáticamente cada 3 días a las 12:00 UTC (09:00 hora de Chile)
+  schedule:
+    - cron: '0 12 */3 * *'
+  # Permite ejecutarlo manualmente desde la pestaña "Actions" en GitHub
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping-supabase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Consultar Supabase para mantener el proyecto activo
+        run: |
+          python3 - <<'EOF'
+          import json
+          import re
+          import sys
+          import urllib.request
+          import urllib.error
+
+          with open("js/config.js", "r", encoding="utf-8") as f:
+              content = f.read()
+
+          url_match = re.search(r'supabaseUrl:\s*"([^"]*)"', content)
+          key_match = re.search(r'supabaseAnonKey:\s*"([^"]*)"', content)
+
+          supabase_url = url_match.group(1).strip().rstrip("/") if url_match else ""
+          anon_key = key_match.group(1).strip() if key_match else ""
+
+          if not supabase_url or not anon_key:
+              print("Supabase no configurado en js/config.js; omitiendo ping.")
+              sys.exit(0)
+
+          endpoint = f"{supabase_url}/rest/v1/rpc/get_public_salon_data"
+          payload = json.dumps({"p_from_date": "2026-01-01", "p_to_date": "2026-01-01"}).encode("utf-8")
+
+          req = urllib.request.Request(
+              endpoint,
+              data=payload,
+              method="POST",
+              headers={
+                  "apikey": anon_key,
+                  "Content-Type": "application/json",
+              },
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  print(f"Ping exitoso a Supabase. HTTP {resp.status}")
+          except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8", errors="replace")
+              print(f"Error HTTP {e.code} al consultar Supabase: {body}")
+              sys.exit(1)
+          EOF
