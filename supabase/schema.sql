@@ -123,13 +123,14 @@ create policy "Lectura publica servicios activos"
 -- ----------------------------------------------------------------------------
 
 -- Obtener solo fechas/horas ocupadas en un rango (sin exponer datos personales de otros clientes)
+drop function if exists public.get_busy_slots_range(text, text);
 create or replace function public.get_busy_slots_range(p_from_date text, p_to_date text)
-returns table (date text, time text, duration int)
+returns table (slot_date text, slot_time text, duration int)
 language sql
 security definer
 set search_path = public
 as $$
-  select a.date, a.time, a.duration
+  select a.date as slot_date, a.time as slot_time, a.duration
   from public.appointments a
   where a.date >= p_from_date
     and a.date <= p_to_date

@@ -342,8 +342,8 @@
     }
     busySlotsCache = Array.isArray(data)
       ? data.map((row) => ({
-          date: row.date,
-          time: row.time,
+          date: row.slot_date ?? row.date,
+          time: row.slot_time ?? row.time,
           duration: Number(row.duration) || 30
         }))
       : [];
@@ -371,8 +371,8 @@
       }
       if (!slotsRes.error && Array.isArray(slotsRes.data)) {
         busySlotsCache = slotsRes.data.map((row) => ({
-          date: row.date,
-          time: row.time,
+          date: row.slot_date ?? row.date,
+          time: row.slot_time ?? row.time,
           duration: Number(row.duration) || 30
         }));
         busySlotsRangeEnd = horizon;
