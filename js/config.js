@@ -12,8 +12,8 @@ window.SALON_CONFIG = {
   // 3. Pega aquí tu "Project URL" y "anon public key" (Project Settings -> API)
   // Mientras estén vacíos (""), la web funcionará en Modo Local (localStorage).
   // --------------------------------------------------------------------------
-  supabaseUrl: "",
-  supabaseAnonKey: "",
+  supabaseUrl: "https://lwbxyhysuogbqnmziewv.supabase.co",
+  supabaseAnonKey: "sb_publishable_t3QdVczBRZPRCUPVccRzgg_LodKa4hp",
 
   // Información general del negocio
   businessName: "C4LEB BARBER",
