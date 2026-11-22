@@ -357,18 +357,48 @@
     const horizon = addDaysISO(today, 30);
 
     try {
+      const rpcRes = await supabaseClient.rpc("get_public_salon_data", {
+        p_from_date: today,
+        p_to_date: horizon
+      });
+
+      if (!rpcRes.error && rpcRes.data) {
+        if (rpcRes.data.settings) {
+          appState.settings = mapDbSettings(rpcRes.data.settings);
+        }
+        if (Array.isArray(rpcRes.data.services)) {
+          appState.services = rpcRes.data.services.map(mapDbService);
+        }
+        if (Array.isArray(rpcRes.data.busy_slots)) {
+          busySlotsCache = rpcRes.data.busy_slots.map((row) => ({
+            date: row.slot_date ?? row.date,
+            time: row.slot_time ?? row.time,
+            duration: Number(row.duration) || 30
+          }));
+          busySlotsRangeEnd = horizon;
+        }
+        return;
+      }
+
+      // Respaldo por consultas directas si aún no se ejecutó get_public_salon_data en SQL
       const [settingsRes, servicesRes, slotsRes] = await Promise.all([
         supabaseClient.from("salon_settings").select("*").eq("id", 1).single(),
         supabaseClient.from("services").select("*").eq("active", true).order("sort_order", { ascending: true }),
         supabaseClient.rpc("get_busy_slots_range", { p_from_date: today, p_to_date: horizon })
       ]);
 
-      if (!settingsRes.error && settingsRes.data) {
+      if (settingsRes.error) {
+        console.error("Error leyendo salon_settings:", settingsRes.error);
+      } else if (settingsRes.data) {
         appState.settings = mapDbSettings(settingsRes.data);
       }
-      if (!servicesRes.error && Array.isArray(servicesRes.data)) {
+
+      if (servicesRes.error) {
+        console.error("Error leyendo services:", servicesRes.error);
+      } else if (Array.isArray(servicesRes.data)) {
         appState.services = servicesRes.data.map(mapDbService);
       }
+
       if (!slotsRes.error && Array.isArray(slotsRes.data)) {
         busySlotsCache = slotsRes.data.map((row) => ({
           date: row.slot_date ?? row.date,
@@ -1710,7 +1740,7 @@
       }
 
       renderBusinessInfo();
-      renderBookingSlots();
+      initBookingDefaults();
       showToast("Configuración guardada correctamente.", "success");
     } catch (err) {
       console.error("Error guardando configuración:", err);

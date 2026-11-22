@@ -122,6 +122,50 @@ create policy "Lectura publica servicios activos"
 -- 4. FUNCIONES PÚBLICAS (CLIENTES)
 -- ----------------------------------------------------------------------------
 
+-- Obtener configuración pública, servicios activos y bloques ocupados en una sola llamada
+drop function if exists public.get_public_salon_data(text, text);
+create or replace function public.get_public_salon_data(p_from_date text, p_to_date text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_settings public.salon_settings%rowtype;
+  v_services jsonb;
+  v_busy_slots jsonb;
+begin
+  select * into v_settings from public.salon_settings where id = 1;
+
+  select coalesce(jsonb_agg(to_jsonb(s) order by s.sort_order, s.created_at), '[]'::jsonb)
+  into v_services
+  from public.services s
+  where s.active = true;
+
+  select coalesce(
+    jsonb_agg(
+      jsonb_build_object(
+        'slot_date', a.date,
+        'slot_time', a.time,
+        'duration', a.duration
+      )
+    ),
+    '[]'::jsonb
+  )
+  into v_busy_slots
+  from public.appointments a
+  where a.date >= p_from_date
+    and a.date <= p_to_date
+    and a.status <> 'cancelada';
+
+  return jsonb_build_object(
+    'settings', to_jsonb(v_settings),
+    'services', v_services,
+    'busy_slots', v_busy_slots
+  );
+end;
+$$;
+
 -- Obtener solo fechas/horas ocupadas en un rango (sin exponer datos personales de otros clientes)
 drop function if exists public.get_busy_slots_range(text, text);
 create or replace function public.get_busy_slots_range(p_from_date text, p_to_date text)
@@ -511,7 +555,12 @@ begin
 end;
 $$;
 
--- Permisos de ejecución para la API pública de Supabase (anon key)
+-- Permisos explícitos de lectura pública y ejecución para la API de Supabase
+grant usage on schema public to anon, authenticated;
+grant select on public.salon_settings to anon, authenticated;
+grant select on public.services to anon, authenticated;
+
+grant execute on function public.get_public_salon_data(text, text) to anon, authenticated;
 grant execute on function public.get_busy_slots_range(text, text) to anon, authenticated;
 grant execute on function public.create_client_appointment(text, text, text, text, text, text, text) to anon, authenticated;
 grant execute on function public.lookup_client_appointments(text) to anon, authenticated;
