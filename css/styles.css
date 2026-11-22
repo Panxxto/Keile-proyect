@@ -969,11 +969,57 @@ textarea {
   margin-bottom: 1.8rem;
 }
 
+.admin-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
 .admin-title {
   font-family: var(--font-display);
   font-size: clamp(1.8rem, 3.2vw, 2.4rem);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  margin: 0;
+}
+
+.sync-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  border: 1px solid var(--border-strong);
+}
+
+.sync-badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.sync-cloud {
+  background-color: var(--success-bg);
+  border-color: rgba(74, 222, 128, 0.35);
+  color: var(--success);
+}
+
+.sync-cloud::before {
+  background-color: var(--success);
+}
+
+.sync-local {
+  background-color: var(--warning-bg);
+  border-color: rgba(251, 191, 36, 0.35);
+  color: var(--warning);
+}
+
+.sync-local::before {
+  background-color: var(--warning);
 }
 
 .admin-topbar-actions {

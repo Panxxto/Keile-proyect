@@ -1,5 +1,6 @@
 /* ==========================================================================
    LÓGICA PRINCIPAL DE C4LEB BARBER Y GESTIÓN DE AGENDA
+   Soporta Modo Nube (Supabase) automático y respaldo en Modo Local (localStorage)
    ========================================================================== */
 
 (function () {
@@ -7,6 +8,7 @@
 
   const STORAGE_KEY = "c4leb_barber_state_v1";
   const SESSION_AUTH_KEY = "c4leb_admin_unlocked";
+  const SESSION_PIN_KEY = "c4leb_admin_pin";
 
   const DAY_NAMES_SHORT = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
   const DAY_NAMES_FULL = [
@@ -19,11 +21,103 @@
     "Sábado"
   ];
 
+  // Cliente de Supabase (null si no se ha configurado supabaseUrl y supabaseAnonKey)
+  let supabaseClient = null;
+
   // Estado global de la aplicación
   let appState = null;
+  let busySlotsCache = [];
+  let busySlotsRangeEnd = null;
+  let activeAdminPin = "";
   let activeServiceCategory = "Todos";
   let activeAdminDateFilter = "today";
   let activeAdminTab = "appointments";
+
+  // ------------------------------------------------------------------------
+  // DETECCIÓN DE MODO (NUBE SUPABASE VS LOCAL)
+  // ------------------------------------------------------------------------
+  function initSupabaseClient() {
+    const cfg = window.SALON_CONFIG || {};
+    if (cfg.supabaseUrl && cfg.supabaseAnonKey && window.supabase && typeof window.supabase.createClient === "function") {
+      supabaseClient = window.supabase.createClient(cfg.supabaseUrl.trim(), cfg.supabaseAnonKey.trim());
+    } else {
+      supabaseClient = null;
+    }
+  }
+
+  function isSupabaseMode() {
+    return supabaseClient !== null;
+  }
+
+  function updateSyncBadge() {
+    const badge = document.getElementById("sync-status-badge");
+    if (!badge) return;
+    if (isSupabaseMode()) {
+      badge.className = "sync-badge sync-cloud";
+      badge.textContent = "Conectado a Supabase";
+    } else {
+      badge.className = "sync-badge sync-local";
+      badge.textContent = "Modo Local (sin Supabase)";
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // MAPEO ENTRE COLUMNAS DE SUPABASE (snake_case) Y APP (camelCase)
+  // ------------------------------------------------------------------------
+  function mapDbSettings(row) {
+    const cfg = window.SALON_CONFIG;
+    if (!row) return buildDefaultState().settings;
+    return {
+      businessName: row.business_name || cfg.businessName,
+      stylistName: row.stylist_name || cfg.stylistName,
+      businessTagline: row.business_tagline || cfg.businessTagline,
+      instagramHandle: row.instagram_handle || cfg.instagramHandle,
+      instagramUrl: row.instagram_url || cfg.instagramUrl,
+      whatsappNumber: row.whatsapp_number || "",
+      currencySymbol: row.currency_symbol || "$",
+      adminPin: activeAdminPin || cfg.adminPin,
+      schedule: {
+        openTime: row.schedule?.openTime || cfg.schedule.openTime,
+        closeTime: row.schedule?.closeTime || cfg.schedule.closeTime,
+        breakStart: row.schedule?.breakStart ?? "",
+        breakEnd: row.schedule?.breakEnd ?? "",
+        slotStepMinutes: Number(row.schedule?.slotStepMinutes) || 15,
+        workingDays: Array.isArray(row.schedule?.workingDays)
+          ? row.schedule.workingDays
+          : [...cfg.schedule.workingDays]
+      }
+    };
+  }
+
+  function mapDbService(row) {
+    return {
+      id: row.id,
+      name: row.name,
+      category: row.category || "Cortes",
+      duration: Number(row.duration) || 30,
+      price: Number(row.price) || 0,
+      description: row.description || "",
+      active: Boolean(row.active)
+    };
+  }
+
+  function mapDbAppointment(row) {
+    return {
+      id: row.id,
+      code: row.code,
+      clientName: row.client_name ?? row.clientName ?? "",
+      clientPhone: row.client_phone ?? row.clientPhone ?? "",
+      serviceId: row.service_id ?? row.serviceId ?? "",
+      serviceName: row.service_name ?? row.serviceName ?? "",
+      duration: Number(row.duration) || 30,
+      price: Number(row.price) || 0,
+      date: row.date,
+      time: row.time,
+      status: row.status || "pendiente",
+      notes: row.notes || "",
+      createdAt: row.created_at ?? row.createdAt ?? new Date().toISOString()
+    };
+  }
 
   // ------------------------------------------------------------------------
   // UTILIDADES DE FECHA, HORA, FORMATO Y SEGURIDAD
@@ -118,7 +212,7 @@
   }
 
   // ------------------------------------------------------------------------
-  // PERSISTENCIA EN LOCALSTORAGE Y DATOS INICIALES
+  // PERSISTENCIA EN LOCALSTORAGE (MODO LOCAL / RESPUESTA INICIAL)
   // ------------------------------------------------------------------------
   function buildDefaultState() {
     const cfg = window.SALON_CONFIG;
@@ -196,12 +290,12 @@
     };
   }
 
-  function loadState() {
+  function loadLocalState() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) {
         const fresh = buildDefaultState();
-        saveState(fresh);
+        saveLocalState(fresh);
         return fresh;
       }
       const parsed = JSON.parse(raw);
@@ -212,14 +306,81 @@
     } catch (err) {
       console.warn("Restaurando estado por defecto:", err);
       const fresh = buildDefaultState();
-      saveState(fresh);
+      saveLocalState(fresh);
       return fresh;
     }
   }
 
-  function saveState(nextState = appState) {
+  function saveLocalState(nextState = appState) {
     appState = nextState;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
+    if (!isSupabaseMode()) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // SINCRONIZACIÓN DE DATOS PÚBLICOS DESDE SUPABASE
+  // ------------------------------------------------------------------------
+  function syncBusySlotsFromAppointments() {
+    busySlotsCache = appState.appointments
+      .filter((a) => a.status !== "cancelada")
+      .map((a) => ({ date: a.date, time: a.time, duration: Number(a.duration) || 30 }));
+  }
+
+  async function refreshBusySlotsRange(fromISO, toISO) {
+    if (!isSupabaseMode()) {
+      syncBusySlotsFromAppointments();
+      return;
+    }
+    const { data, error } = await supabaseClient.rpc("get_busy_slots_range", {
+      p_from_date: fromISO,
+      p_to_date: toISO
+    });
+    if (error) {
+      console.error("Error consultando horarios:", error);
+      return;
+    }
+    busySlotsCache = Array.isArray(data)
+      ? data.map((row) => ({
+          date: row.date,
+          time: row.time,
+          duration: Number(row.duration) || 30
+        }))
+      : [];
+    busySlotsRangeEnd = toISO;
+  }
+
+  async function refreshPublicDataFromSupabase() {
+    if (!isSupabaseMode()) return;
+
+    const today = getTodayISO();
+    const horizon = addDaysISO(today, 30);
+
+    try {
+      const [settingsRes, servicesRes, slotsRes] = await Promise.all([
+        supabaseClient.from("salon_settings").select("*").eq("id", 1).single(),
+        supabaseClient.from("services").select("*").eq("active", true).order("sort_order", { ascending: true }),
+        supabaseClient.rpc("get_busy_slots_range", { p_from_date: today, p_to_date: horizon })
+      ]);
+
+      if (!settingsRes.error && settingsRes.data) {
+        appState.settings = mapDbSettings(settingsRes.data);
+      }
+      if (!servicesRes.error && Array.isArray(servicesRes.data)) {
+        appState.services = servicesRes.data.map(mapDbService);
+      }
+      if (!slotsRes.error && Array.isArray(slotsRes.data)) {
+        busySlotsCache = slotsRes.data.map((row) => ({
+          date: row.date,
+          time: row.time,
+          duration: Number(row.duration) || 30
+        }));
+        busySlotsRangeEnd = horizon;
+      }
+    } catch (err) {
+      console.error("Error cargando datos públicos desde Supabase:", err);
+      showToast("No se pudo conectar con Supabase. Revisa tu conexión o configuración.", "error");
+    }
   }
 
   // ------------------------------------------------------------------------
@@ -249,13 +410,15 @@
     const breakEnd = timeToMinutes(schedule.breakEnd);
     const hasBreak = breakStart !== null && breakEnd !== null && breakStart < breakEnd;
 
-    // Citas activas en la misma fecha (las canceladas liberan el espacio)
-    const dayAppointments = appState.appointments.filter(
-      (apt) =>
-        apt.date === dateISO &&
-        apt.status !== "cancelada" &&
-        apt.id !== excludeAppointmentId
-    );
+    // En modo Supabase público usamos busySlotsCache; en modo local usamos appState.appointments
+    const dayBusyBlocks = isSupabaseMode()
+      ? busySlotsCache.filter((b) => b.date === dateISO)
+      : appState.appointments.filter(
+          (apt) =>
+            apt.date === dateISO &&
+            apt.status !== "cancelada" &&
+            apt.id !== excludeAppointmentId
+        );
 
     const todayISO = getTodayISO();
     const now = new Date();
@@ -267,21 +430,18 @@
       let available = true;
       let reason = "";
 
-      // Si es hoy, exigir al menos 15 min de margen
       if (dateISO === todayISO && start <= nowMinutes + 15) {
         available = false;
         reason = "Horario pasado";
       }
 
-      // Verificar cruce con horario de descanso / almuerzo
       if (available && hasBreak && start < breakEnd && end > breakStart) {
         available = false;
         reason = "Descanso";
       }
 
-      // Verificar cruce con otras citas agendadas
       if (available) {
-        const conflict = dayAppointments.some((apt) => {
+        const conflict = dayBusyBlocks.some((apt) => {
           const aptStart = timeToMinutes(apt.time);
           const aptEnd = aptStart + (Number(apt.duration) || 30);
           return start < aptEnd && end > aptStart;
@@ -405,7 +565,6 @@
     const filtersContainer = document.getElementById("service-category-filters");
     filtersContainer.innerHTML = "";
 
-    // Mostrar pestañas de categoría solo si hay más de 3 servicios activos y más de 1 categoría
     if (activeServices.length > 3 && categories.length > 2) {
       filtersContainer.classList.remove("hidden");
       categories.forEach((cat) => {
@@ -613,7 +772,15 @@
     document.getElementById("summary-price").textContent = service ? formatCurrency(service.price) : "—";
   }
 
-  function handleClientBookingSubmit(event) {
+  async function handleDateInputChange() {
+    const dateISO = document.getElementById("booking-date").value;
+    if (isSupabaseMode() && dateISO && (!busySlotsRangeEnd || dateISO > busySlotsRangeEnd)) {
+      await refreshBusySlotsRange(getTodayISO(), addDaysISO(dateISO, 14));
+    }
+    renderBookingSlots();
+  }
+
+  async function handleClientBookingSubmit(event) {
     event.preventDefault();
 
     const service = getSelectedBookingService();
@@ -646,44 +813,89 @@
       return;
     }
 
-    const latestSlots = getAvailableSlotsForDate(dateISO, service.duration);
-    const targetSlot = latestSlots.find((s) => s.time === timeStr && s.available);
-    if (!targetSlot) {
-      showToast("Ese horario ya no está disponible. Elige otro por favor.", "error");
+    const submitBtn = event.target.querySelector('button[type="submit"]');
+    const originalBtnText = submitBtn.textContent;
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Reservando...";
+
+    try {
+      let createdAppointment = null;
+
+      if (isSupabaseMode()) {
+        const { data, error } = await supabaseClient.rpc("create_client_appointment", {
+          p_id: generateId("apt"),
+          p_client_name: clientName,
+          p_client_phone: clientPhone,
+          p_service_id: service.id,
+          p_date: dateISO,
+          p_time: timeStr,
+          p_notes: notes
+        });
+
+        if (error) {
+          if (error.message && error.message.includes("HORARIO_OCUPADO")) {
+            showToast("Ese horario acaba de ser ocupado por otro cliente. Elige otro.", "error");
+            await refreshBusySlotsRange(getTodayISO(), addDaysISO(dateISO, 21));
+            renderBookingSlots();
+            renderHeroQuickSlots();
+            return;
+          }
+          throw error;
+        }
+
+        createdAppointment = mapDbAppointment(data);
+        busySlotsCache.push({
+          date: createdAppointment.date,
+          time: createdAppointment.time,
+          duration: createdAppointment.duration
+        });
+      } else {
+        const latestSlots = getAvailableSlotsForDate(dateISO, service.duration);
+        const targetSlot = latestSlots.find((s) => s.time === timeStr && s.available);
+        if (!targetSlot) {
+          showToast("Ese horario ya no está disponible. Elige otro por favor.", "error");
+          renderBookingSlots();
+          return;
+        }
+
+        createdAppointment = {
+          id: generateId("apt"),
+          code: generateBookingCode(),
+          clientName,
+          clientPhone,
+          serviceId: service.id,
+          serviceName: service.name,
+          duration: service.duration,
+          price: service.price,
+          date: dateISO,
+          time: timeStr,
+          status: "pendiente",
+          notes,
+          createdAt: new Date().toISOString()
+        };
+
+        appState.appointments.push(createdAppointment);
+        saveLocalState();
+      }
+
+      document.getElementById("client-name").value = "";
+      document.getElementById("client-phone").value = "";
+      document.getElementById("client-notes").value = "";
       renderBookingSlots();
-      return;
+      renderHeroQuickSlots();
+      if (!document.getElementById("admin-view").classList.contains("hidden")) {
+        renderAdminPanel();
+      }
+
+      openConfirmationModal(createdAppointment);
+      showToast("¡Reserva creada con éxito!", "success");
+    } catch (err) {
+      console.error("Error al crear reserva:", err);
+      showToast("Ocurrió un error al guardar tu reserva. Intenta nuevamente.", "error");
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = originalBtnText;
     }
-
-    const newAppointment = {
-      id: generateId("apt"),
-      code: generateBookingCode(),
-      clientName,
-      clientPhone,
-      serviceId: service.id,
-      serviceName: service.name,
-      duration: service.duration,
-      price: service.price,
-      date: dateISO,
-      time: timeStr,
-      status: "pendiente",
-      notes,
-      createdAt: new Date().toISOString()
-    };
-
-    appState.appointments.push(newAppointment);
-    saveState();
-
-    document.getElementById("client-name").value = "";
-    document.getElementById("client-phone").value = "";
-    document.getElementById("client-notes").value = "";
-    renderBookingSlots();
-    renderHeroQuickSlots();
-    if (!document.getElementById("admin-view").classList.contains("hidden")) {
-      renderAdminPanel();
-    }
-
-    openConfirmationModal(newAppointment);
-    showToast("¡Reserva creada con éxito!", "success");
   }
 
   function buildWhatsAppUrl(phoneNumber, messageText) {
@@ -723,23 +935,45 @@
   // ------------------------------------------------------------------------
   // CONSULTAR / CANCELAR CITA (CLIENTE)
   // ------------------------------------------------------------------------
-  function handleLookupSubmit(event) {
+  async function handleLookupSubmit(event) {
     event.preventDefault();
     const rawQuery = document.getElementById("lookup-query").value.trim();
     const resultsContainer = document.getElementById("lookup-results");
 
     if (!rawQuery) return;
 
-    const queryUpper = rawQuery.toUpperCase();
-    const queryDigits = normalizePhone(rawQuery);
+    let matches = [];
+    if (isSupabaseMode()) {
+      const isCode = /^CITA-/i.test(rawQuery);
+      const digits = normalizePhone(rawQuery);
+      if (!isCode && digits.length < 6) {
+        resultsContainer.innerHTML = `<div class="empty-state">Ingresa tu código (ej. <code>CITA-1024</code>) o al menos 6 dígitos de tu teléfono.</div>`;
+        return;
+      }
 
-    const matches = appState.appointments
-      .filter((apt) => {
-        const codeMatch = apt.code.toUpperCase() === queryUpper;
-        const phoneMatch = queryDigits.length >= 4 && normalizePhone(apt.clientPhone).includes(queryDigits);
-        return codeMatch || phoneMatch;
-      })
-      .sort((a, b) => `${b.date} ${b.time}`.localeCompare(`${a.date} ${a.time}`));
+      resultsContainer.innerHTML = `<div class="empty-state">Buscando...</div>`;
+      const { data, error } = await supabaseClient.rpc("lookup_client_appointments", {
+        p_query: rawQuery
+      });
+      if (error) {
+        console.error(error);
+        showToast("Error al buscar tu cita.", "error");
+        resultsContainer.innerHTML = "";
+        return;
+      }
+      matches = Array.isArray(data) ? data.map(mapDbAppointment) : [];
+    } else {
+      const queryUpper = rawQuery.toUpperCase();
+      const queryDigits = normalizePhone(rawQuery);
+
+      matches = appState.appointments
+        .filter((apt) => {
+          const codeMatch = apt.code.toUpperCase() === queryUpper;
+          const phoneMatch = queryDigits.length >= 4 && normalizePhone(apt.clientPhone).includes(queryDigits);
+          return codeMatch || phoneMatch;
+        })
+        .sort((a, b) => `${b.date} ${b.time}`.localeCompare(`${a.date} ${a.time}`));
+    }
 
     if (matches.length === 0) {
       resultsContainer.innerHTML = `<div class="empty-state">No encontramos citas con ese código o número de teléfono.</div>`;
@@ -765,7 +999,7 @@
         <div>
           ${
             canCancel
-              ? `<button type="button" class="btn btn-danger-outline btn-sm cancel-client-apt-btn" data-id="${escapeHtml(apt.id)}">Cancelar cita</button>`
+              ? `<button type="button" class="btn btn-danger-outline btn-sm cancel-client-apt-btn">Cancelar cita</button>`
               : ""
           }
         </div>
@@ -773,12 +1007,26 @@
 
       const cancelBtn = card.querySelector(".cancel-client-apt-btn");
       if (cancelBtn) {
-        cancelBtn.addEventListener("click", () => {
+        cancelBtn.addEventListener("click", async () => {
           if (!confirm(`¿Seguro que deseas cancelar tu cita ${apt.code} del ${formatDisplayDate(apt.date)}?`)) {
             return;
           }
-          apt.status = "cancelada";
-          saveState();
+
+          if (isSupabaseMode()) {
+            const { data, error } = await supabaseClient.rpc("cancel_client_appointment", {
+              p_id: apt.id,
+              p_code: apt.code
+            });
+            if (error || !data) {
+              showToast("No se pudo cancelar la cita.", "error");
+              return;
+            }
+            await refreshBusySlotsRange(getTodayISO(), addDaysISO(getTodayISO(), 30));
+          } else {
+            apt.status = "cancelada";
+            saveLocalState();
+          }
+
           renderBookingSlots();
           renderHeroQuickSlots();
           handleLookupSubmit(new Event("submit"));
@@ -793,44 +1041,89 @@
   // ------------------------------------------------------------------------
   // AUTENTICACIÓN Y NAVEGACIÓN AL PANEL DEL BARBERO
   // ------------------------------------------------------------------------
+  function getStoredPin() {
+    return activeAdminPin || sessionStorage.getItem(SESSION_PIN_KEY) || "";
+  }
+
   function isAdminUnlocked() {
-    return sessionStorage.getItem(SESSION_AUTH_KEY) === "true";
+    return sessionStorage.getItem(SESSION_AUTH_KEY) === "true" && Boolean(getStoredPin());
   }
 
-  function requestOpenAdmin() {
+  async function loadAdminDashboardFromSupabase(pin) {
+    const { data, error } = await supabaseClient.rpc("admin_verify_and_load", { p_pin: pin });
+    if (error) throw error;
+
+    activeAdminPin = pin;
+    appState.settings = mapDbSettings(data.settings);
+    appState.services = Array.isArray(data.services) ? data.services.map(mapDbService) : [];
+    appState.appointments = Array.isArray(data.appointments) ? data.appointments.map(mapDbAppointment) : [];
+    syncBusySlotsFromAppointments();
+  }
+
+  async function requestOpenAdmin() {
     if (isAdminUnlocked()) {
-      showAdminView();
-    } else {
-      document.getElementById("pin-input").value = "";
-      openModal("pin-modal");
-      setTimeout(() => document.getElementById("pin-input").focus(), 80);
+      if (isSupabaseMode()) {
+        try {
+          await loadAdminDashboardFromSupabase(getStoredPin());
+          showAdminView();
+          return;
+        } catch (err) {
+          sessionStorage.removeItem(SESSION_AUTH_KEY);
+          sessionStorage.removeItem(SESSION_PIN_KEY);
+          activeAdminPin = "";
+        }
+      } else {
+        showAdminView();
+        return;
+      }
     }
+
+    document.getElementById("pin-input").value = "";
+    openModal("pin-modal");
+    setTimeout(() => document.getElementById("pin-input").focus(), 80);
   }
 
-  function handlePinSubmit(event) {
+  async function handlePinSubmit(event) {
     event.preventDefault();
     const entered = document.getElementById("pin-input").value.trim();
-    if (entered === appState.settings.adminPin) {
+    const submitBtn = event.target.querySelector('button[type="submit"]');
+    submitBtn.disabled = true;
+
+    try {
+      if (isSupabaseMode()) {
+        await loadAdminDashboardFromSupabase(entered);
+      } else if (entered !== appState.settings.adminPin) {
+        throw new Error("PIN_INVALIDO");
+      }
+
+      activeAdminPin = entered;
       sessionStorage.setItem(SESSION_AUTH_KEY, "true");
+      sessionStorage.setItem(SESSION_PIN_KEY, entered);
       closeModal("pin-modal");
       showAdminView();
       showToast("Bienvenido al panel de gestión.", "success");
-    } else {
+    } catch (err) {
       showToast("PIN incorrecto. Intenta nuevamente.", "error");
       document.getElementById("pin-input").select();
+    } finally {
+      submitBtn.disabled = false;
     }
   }
 
   function showAdminView() {
     document.getElementById("client-view").classList.add("hidden");
     document.getElementById("admin-view").classList.remove("hidden");
+    updateSyncBadge();
     window.scrollTo({ top: 0, behavior: "smooth" });
     renderAdminPanel();
   }
 
-  function hideAdminView() {
+  async function hideAdminView() {
     document.getElementById("admin-view").classList.add("hidden");
     document.getElementById("client-view").classList.remove("hidden");
+    if (isSupabaseMode()) {
+      await refreshPublicDataFromSupabase();
+    }
     renderBusinessInfo();
     renderClientServices();
     renderBookingSlots();
@@ -839,6 +1132,8 @@
 
   function lockAdminPanel() {
     sessionStorage.removeItem(SESSION_AUTH_KEY);
+    sessionStorage.removeItem(SESSION_PIN_KEY);
+    activeAdminPin = "";
     hideAdminView();
     showToast("Panel bloqueado.", "info");
   }
@@ -851,6 +1146,12 @@
     renderAdminAppointments();
     renderAdminServices();
     populateSettingsForm();
+
+    // En modo nube ocultamos botones exclusivos de modo local para evitar confusión
+    const resetBtn = document.getElementById("reset-demo-btn");
+    const importLabel = document.getElementById("import-data-input")?.closest("label");
+    if (resetBtn) resetBtn.classList.toggle("hidden", isSupabaseMode());
+    if (importLabel) importLabel.classList.toggle("hidden", isSupabaseMode());
   }
 
   function renderAdminKPIs() {
@@ -970,28 +1271,57 @@
     });
   }
 
-  function handleAppointmentAction(id, action) {
+  async function handleAppointmentAction(id, action) {
     const apt = appState.appointments.find((a) => a.id === id);
     if (!apt) return;
 
-    if (action === "confirm") {
-      apt.status = "confirmada";
-      saveState();
-      renderAdminPanel();
-      showToast(`Cita ${apt.code} confirmada.`, "success");
-    } else if (action === "complete") {
-      apt.status = "completada";
-      saveState();
-      renderAdminPanel();
-      showToast(`Cita ${apt.code} marcada como completada.`, "success");
-    } else if (action === "edit") {
-      openAdminAppointmentModal(apt);
-    } else if (action === "delete") {
-      if (!confirm(`¿Eliminar la cita de ${apt.clientName} (${apt.code})?`)) return;
-      appState.appointments = appState.appointments.filter((a) => a.id !== id);
-      saveState();
-      renderAdminPanel();
-      showToast("Cita eliminada.", "info");
+    try {
+      if (action === "confirm") {
+        if (isSupabaseMode()) {
+          const { error } = await supabaseClient.rpc("admin_update_appointment_status", {
+            p_pin: getStoredPin(),
+            p_id: id,
+            p_status: "confirmada"
+          });
+          if (error) throw error;
+        }
+        apt.status = "confirmada";
+        saveLocalState();
+        renderAdminPanel();
+        showToast(`Cita ${apt.code} confirmada.`, "success");
+      } else if (action === "complete") {
+        if (isSupabaseMode()) {
+          const { error } = await supabaseClient.rpc("admin_update_appointment_status", {
+            p_pin: getStoredPin(),
+            p_id: id,
+            p_status: "completada"
+          });
+          if (error) throw error;
+        }
+        apt.status = "completada";
+        saveLocalState();
+        renderAdminPanel();
+        showToast(`Cita ${apt.code} marcada como completada.`, "success");
+      } else if (action === "edit") {
+        openAdminAppointmentModal(apt);
+      } else if (action === "delete") {
+        if (!confirm(`¿Eliminar la cita de ${apt.clientName} (${apt.code})?`)) return;
+        if (isSupabaseMode()) {
+          const { error } = await supabaseClient.rpc("admin_delete_appointment", {
+            p_pin: getStoredPin(),
+            p_id: id
+          });
+          if (error) throw error;
+        }
+        appState.appointments = appState.appointments.filter((a) => a.id !== id);
+        syncBusySlotsFromAppointments();
+        saveLocalState();
+        renderAdminPanel();
+        showToast("Cita eliminada.", "info");
+      }
+    } catch (err) {
+      console.error("Error ejecutando acción:", err);
+      showToast("No se pudo actualizar la cita en la base de datos.", "error");
     }
   }
 
@@ -1014,7 +1344,7 @@
     openModal("appointment-modal");
   }
 
-  function handleAdminAppointmentSubmit(event) {
+  async function handleAdminAppointmentSubmit(event) {
     event.preventDefault();
     const id = document.getElementById("admin-apt-id").value;
     const clientName = document.getElementById("admin-apt-client").value.trim();
@@ -1031,43 +1361,76 @@
       return;
     }
 
-    if (id) {
-      const existing = appState.appointments.find((a) => a.id === id);
-      if (existing) {
-        existing.clientName = clientName;
-        existing.clientPhone = clientPhone;
-        existing.serviceId = service.id;
-        existing.serviceName = service.name;
-        existing.duration = service.duration;
-        existing.price = service.price;
-        existing.status = status;
-        existing.date = date;
-        existing.time = time;
-        existing.notes = notes;
-      }
-      showToast("Cita actualizada.", "success");
-    } else {
-      appState.appointments.push({
-        id: generateId("apt"),
-        code: generateBookingCode(),
-        clientName,
-        clientPhone,
-        serviceId: service.id,
-        serviceName: service.name,
-        duration: service.duration,
-        price: service.price,
-        date,
-        time,
-        status,
-        notes,
-        createdAt: new Date().toISOString()
-      });
-      showToast("Cita agregada a la agenda.", "success");
-    }
+    try {
+      const targetId = id || generateId("apt");
 
-    saveState();
-    closeModal("appointment-modal");
-    renderAdminPanel();
+      if (isSupabaseMode()) {
+        const { data, error } = await supabaseClient.rpc("admin_save_appointment", {
+          p_pin: getStoredPin(),
+          p_id: targetId,
+          p_client_name: clientName,
+          p_client_phone: clientPhone,
+          p_service_id: service.id,
+          p_service_name: service.name,
+          p_duration: service.duration,
+          p_price: Math.round(service.price),
+          p_date: date,
+          p_time: time,
+          p_status: status,
+          p_notes: notes
+        });
+        if (error) throw error;
+
+        const saved = mapDbAppointment(data);
+        const idx = appState.appointments.findIndex((a) => a.id === saved.id);
+        if (idx >= 0) {
+          appState.appointments[idx] = saved;
+        } else {
+          appState.appointments.push(saved);
+        }
+        syncBusySlotsFromAppointments();
+      } else {
+        if (id) {
+          const existing = appState.appointments.find((a) => a.id === id);
+          if (existing) {
+            existing.clientName = clientName;
+            existing.clientPhone = clientPhone;
+            existing.serviceId = service.id;
+            existing.serviceName = service.name;
+            existing.duration = service.duration;
+            existing.price = service.price;
+            existing.status = status;
+            existing.date = date;
+            existing.time = time;
+            existing.notes = notes;
+          }
+        } else {
+          appState.appointments.push({
+            id: targetId,
+            code: generateBookingCode(),
+            clientName,
+            clientPhone,
+            serviceId: service.id,
+            serviceName: service.name,
+            duration: service.duration,
+            price: service.price,
+            date,
+            time,
+            status,
+            notes,
+            createdAt: new Date().toISOString()
+          });
+        }
+        saveLocalState();
+      }
+
+      closeModal("appointment-modal");
+      renderAdminPanel();
+      showToast(id ? "Cita actualizada." : "Cita agregada a la agenda.", "success");
+    } catch (err) {
+      console.error("Error guardando cita:", err);
+      showToast("Error al guardar la cita.", "error");
+    }
   }
 
   // ------------------------------------------------------------------------
@@ -1098,12 +1461,29 @@
         </div>
       `;
 
-      row.querySelector('[data-srv-action="toggle"]').addEventListener("click", () => {
-        srv.active = !srv.active;
-        saveState();
-        renderAdminServices();
-        renderClientServices();
-        showToast(srv.active ? "Servicio activado." : "Servicio ocultado para clientes.", "info");
+      row.querySelector('[data-srv-action="toggle"]').addEventListener("click", async () => {
+        try {
+          if (isSupabaseMode()) {
+            const { error } = await supabaseClient.rpc("admin_save_service", {
+              p_pin: getStoredPin(),
+              p_id: srv.id,
+              p_name: srv.name,
+              p_category: srv.category,
+              p_duration: srv.duration,
+              p_price: Math.round(srv.price),
+              p_description: srv.description || "",
+              p_active: !srv.active
+            });
+            if (error) throw error;
+          }
+          srv.active = !srv.active;
+          saveLocalState();
+          renderAdminServices();
+          renderClientServices();
+          showToast(srv.active ? "Servicio activado." : "Servicio ocultado para clientes.", "info");
+        } catch (err) {
+          showToast("No se pudo actualizar el servicio.", "error");
+        }
       });
 
       row.querySelector('[data-srv-action="edit"]').addEventListener("click", () => {
@@ -1118,17 +1498,28 @@
         document.getElementById("cancel-service-edit-btn").classList.remove("hidden");
       });
 
-      row.querySelector('[data-srv-action="delete"]').addEventListener("click", () => {
+      row.querySelector('[data-srv-action="delete"]').addEventListener("click", async () => {
         if (appState.services.length <= 1) {
           showToast("Debes mantener al menos un servicio.", "error");
           return;
         }
         if (!confirm(`¿Eliminar el servicio "${srv.name}"?`)) return;
-        appState.services = appState.services.filter((s) => s.id !== srv.id);
-        saveState();
-        renderAdminServices();
-        renderClientServices();
-        showToast("Servicio eliminado.", "info");
+        try {
+          if (isSupabaseMode()) {
+            const { error } = await supabaseClient.rpc("admin_delete_service", {
+              p_pin: getStoredPin(),
+              p_id: srv.id
+            });
+            if (error) throw error;
+          }
+          appState.services = appState.services.filter((s) => s.id !== srv.id);
+          saveLocalState();
+          renderAdminServices();
+          renderClientServices();
+          showToast("Servicio eliminado.", "info");
+        } catch (err) {
+          showToast("No se pudo eliminar el servicio.", "error");
+        }
       });
 
       container.appendChild(row);
@@ -1144,7 +1535,7 @@
     document.getElementById("cancel-service-edit-btn").classList.add("hidden");
   }
 
-  function handleAdminServiceSubmit(event) {
+  async function handleAdminServiceSubmit(event) {
     event.preventDefault();
     const editId = document.getElementById("edit-service-id").value;
     const name = document.getElementById("service-name-input").value.trim();
@@ -1159,34 +1550,61 @@
       return;
     }
 
-    if (editId) {
-      const target = appState.services.find((s) => s.id === editId);
-      if (target) {
-        target.name = name;
-        target.category = category;
-        target.duration = duration;
-        target.price = price;
-        target.active = active;
-        target.description = description;
-      }
-      showToast("Servicio actualizado.", "success");
-    } else {
-      appState.services.push({
-        id: generateId("srv"),
-        name,
-        category,
-        duration,
-        price,
-        active,
-        description
-      });
-      showToast("Nuevo servicio agregado.", "success");
-    }
+    try {
+      const targetId = editId || generateId("srv");
+      if (isSupabaseMode()) {
+        const { data, error } = await supabaseClient.rpc("admin_save_service", {
+          p_pin: getStoredPin(),
+          p_id: targetId,
+          p_name: name,
+          p_category: category,
+          p_duration: duration,
+          p_price: Math.round(price),
+          p_description: description,
+          p_active: active
+        });
+        if (error) throw error;
 
-    saveState();
-    resetServiceForm();
-    renderAdminServices();
-    renderClientServices();
+        const saved = mapDbService(data);
+        const idx = appState.services.findIndex((s) => s.id === saved.id);
+        if (idx >= 0) {
+          appState.services[idx] = saved;
+        } else {
+          appState.services.push(saved);
+        }
+      } else {
+        if (editId) {
+          const target = appState.services.find((s) => s.id === editId);
+          if (target) {
+            target.name = name;
+            target.category = category;
+            target.duration = duration;
+            target.price = price;
+            target.active = active;
+            target.description = description;
+          }
+        } else {
+          appState.services.push({
+            id: targetId,
+            name,
+            category,
+            duration,
+            price,
+            active,
+            description
+          });
+        }
+        saveLocalState();
+      }
+
+      resetServiceForm();
+      renderAdminServices();
+      renderClientServices();
+      showToast(editId ? "Servicio actualizado." : "Nuevo servicio agregado.", "success");
+    } catch (err) {
+      console.error("Error guardando servicio:", err);
+      showToast("No se pudo guardar el servicio.", "error");
+    }
   }
 
   // ------------------------------------------------------------------------
@@ -1205,14 +1623,14 @@
     document.getElementById("setting-slot-step").value = String(s.schedule.slotStepMinutes);
     document.getElementById("setting-break-start").value = s.schedule.breakStart || "";
     document.getElementById("setting-break-end").value = s.schedule.breakEnd || "";
-    document.getElementById("setting-admin-pin").value = s.adminPin;
+    document.getElementById("setting-admin-pin").value = getStoredPin() || s.adminPin;
 
     document.querySelectorAll('#setting-working-days input[type="checkbox"]').forEach((cb) => {
       cb.checked = s.schedule.workingDays.includes(Number(cb.value));
     });
   }
 
-  function handleSettingsSubmit(event) {
+  async function handleSettingsSubmit(event) {
     event.preventDefault();
 
     const openTime = document.getElementById("setting-open-time").value;
@@ -1236,20 +1654,13 @@
       return;
     }
 
-    const pin = document.getElementById("setting-admin-pin").value.trim();
-    if (pin.length < 4) {
+    const newPin = document.getElementById("setting-admin-pin").value.trim();
+    if (newPin.length < 4) {
       showToast("El PIN debe tener al menos 4 caracteres.", "error");
       return;
     }
 
-    appState.settings.businessName = document.getElementById("setting-business-name").value.trim();
-    appState.settings.stylistName = document.getElementById("setting-stylist-name").value.trim();
-    appState.settings.whatsappNumber = normalizePhone(document.getElementById("setting-whatsapp").value);
-    appState.settings.currencySymbol = document.getElementById("setting-currency").value.trim() || "$";
-    appState.settings.instagramHandle = document.getElementById("setting-instagram-handle").value.trim();
-    appState.settings.instagramUrl = document.getElementById("setting-instagram-url").value.trim();
-    appState.settings.adminPin = pin;
-    appState.settings.schedule = {
+    const nextSchedule = {
       openTime,
       closeTime,
       breakStart,
@@ -1258,14 +1669,61 @@
       workingDays
     };
 
-    saveState();
-    renderBusinessInfo();
-    renderBookingSlots();
-    showToast("Configuración guardada correctamente.", "success");
+    const nextBusinessName = document.getElementById("setting-business-name").value.trim();
+    const nextStylistName = document.getElementById("setting-stylist-name").value.trim();
+    const nextWhatsapp = normalizePhone(document.getElementById("setting-whatsapp").value);
+    const nextCurrency = document.getElementById("setting-currency").value.trim() || "$";
+    const nextIgHandle = document.getElementById("setting-instagram-handle").value.trim();
+    const nextIgUrl = document.getElementById("setting-instagram-url").value.trim();
+
+    try {
+      if (isSupabaseMode()) {
+        const currentPin = getStoredPin();
+        const { data, error } = await supabaseClient.rpc("admin_save_settings", {
+          p_pin: currentPin,
+          p_business_name: nextBusinessName,
+          p_stylist_name: nextStylistName,
+          p_whatsapp_number: nextWhatsapp,
+          p_currency_symbol: nextCurrency,
+          p_instagram_handle: nextIgHandle,
+          p_instagram_url: nextIgUrl,
+          p_schedule: nextSchedule,
+          p_new_pin: newPin
+        });
+        if (error) throw error;
+
+        activeAdminPin = newPin;
+        sessionStorage.setItem(SESSION_PIN_KEY, newPin);
+        appState.settings = mapDbSettings(data);
+      } else {
+        appState.settings.businessName = nextBusinessName;
+        appState.settings.stylistName = nextStylistName;
+        appState.settings.whatsappNumber = nextWhatsapp;
+        appState.settings.currencySymbol = nextCurrency;
+        appState.settings.instagramHandle = nextIgHandle;
+        appState.settings.instagramUrl = nextIgUrl;
+        appState.settings.adminPin = newPin;
+        appState.settings.schedule = nextSchedule;
+        activeAdminPin = newPin;
+        sessionStorage.setItem(SESSION_PIN_KEY, newPin);
+        saveLocalState();
+      }
+
+      renderBusinessInfo();
+      renderBookingSlots();
+      showToast("Configuración guardada correctamente.", "success");
+    } catch (err) {
+      console.error("Error guardando configuración:", err);
+      showToast("No se pudo guardar la configuración.", "error");
+    }
   }
 
   function handleExportData() {
-    const blob = new Blob([JSON.stringify(appState, null, 2)], { type: "application/json" });
+    const exportPayload = {
+      ...appState,
+      settings: { ...appState.settings, adminPin: undefined }
+    };
+    const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -1286,7 +1744,7 @@
         if (!imported.settings || !Array.isArray(imported.services) || !Array.isArray(imported.appointments)) {
           throw new Error("Archivo incompatible");
         }
-        saveState(imported);
+        saveLocalState(imported);
         renderBusinessInfo();
         renderClientServices();
         renderAdminPanel();
@@ -1305,7 +1763,8 @@
       return;
     }
     const fresh = buildDefaultState();
-    saveState(fresh);
+    saveLocalState(fresh);
+    syncBusySlotsFromAppointments();
     renderBusinessInfo();
     renderClientServices();
     initBookingDefaults();
@@ -1351,7 +1810,7 @@
       renderBookingSlots();
       updateBookingSummary();
     });
-    document.getElementById("booking-date").addEventListener("change", renderBookingSlots);
+    document.getElementById("booking-date").addEventListener("change", handleDateInputChange);
     document.getElementById("booking-form").addEventListener("submit", handleClientBookingSubmit);
     document.getElementById("lookup-form").addEventListener("submit", handleLookupSubmit);
 
@@ -1398,16 +1857,49 @@
     document.getElementById("export-data-btn").addEventListener("click", handleExportData);
     document.getElementById("import-data-input").addEventListener("change", handleImportData);
     document.getElementById("reset-demo-btn").addEventListener("click", handleResetDemo);
+
+    // Refresco automático de disponibilidad en la vista cliente cuando Supabase está activo
+    document.addEventListener("visibilitychange", async () => {
+      if (
+        document.visibilityState === "visible" &&
+        isSupabaseMode() &&
+        document.getElementById("admin-view").classList.contains("hidden")
+      ) {
+        await refreshBusySlotsRange(getTodayISO(), addDaysISO(getTodayISO(), 30));
+        renderBookingSlots();
+        renderHeroQuickSlots();
+      }
+    });
+
+    setInterval(async () => {
+      if (
+        isSupabaseMode() &&
+        document.visibilityState === "visible" &&
+        document.getElementById("admin-view").classList.contains("hidden")
+      ) {
+        await refreshBusySlotsRange(getTodayISO(), addDaysISO(getTodayISO(), 30));
+        renderBookingSlots();
+        renderHeroQuickSlots();
+      }
+    }, 30000);
   }
 
   // ------------------------------------------------------------------------
   // INICIALIZACIÓN
   // ------------------------------------------------------------------------
-  document.addEventListener("DOMContentLoaded", () => {
-    appState = loadState();
+  document.addEventListener("DOMContentLoaded", async () => {
+    initSupabaseClient();
+    appState = isSupabaseMode() ? buildDefaultState() : loadLocalState();
+    syncBusySlotsFromAppointments();
+    bindEvents();
+
+    if (isSupabaseMode()) {
+      await refreshPublicDataFromSupabase();
+    }
+
+    updateSyncBadge();
     renderBusinessInfo();
     renderClientServices();
     initBookingDefaults();
-    bindEvents();
   });
 })();

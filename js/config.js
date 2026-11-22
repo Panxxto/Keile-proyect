@@ -5,6 +5,16 @@
    ========================================================================== */
 
 window.SALON_CONFIG = {
+  // --------------------------------------------------------------------------
+  // CONEXIÓN A SUPABASE (Base de datos en la nube)
+  // 1. Crea tu proyecto gratis en https://supabase.com
+  // 2. Ejecuta el archivo supabase/schema.sql en "SQL Editor"
+  // 3. Pega aquí tu "Project URL" y "anon public key" (Project Settings -> API)
+  // Mientras estén vacíos (""), la web funcionará en Modo Local (localStorage).
+  // --------------------------------------------------------------------------
+  supabaseUrl: "",
+  supabaseAnonKey: "",
+
   // Información general del negocio
   businessName: "C4LEB BARBER",
   stylistName: "Caleb",
